@@ -4,6 +4,7 @@ import {solve} from '../math/parser.ts'
 import { StrokeHistory } from '../history';
 import { AnswerLayer } from '../overlay/answers';
 import { toAnswers } from '../overlay/toAnswers';
+import { ClearIcon, EraserIcon, LogoIcon, PenIcon, RedoIcon, UndoIcon } from '../ui/icons';
 
 
 export type Point = { x: number; y: number };
@@ -12,6 +13,8 @@ export type Stroke = { points: Point[]; width: number };
 type Tool = 'pen' | 'eraser';
 
 const ERASER_RADIUS = 12;
+const MIN_WIDTH = 1;
+const MAX_WIDTH = 12;
 
 
 
@@ -49,6 +52,12 @@ export default function Canvas() {
   // Only these two flags reach React, so the Undo/Redo buttons can enable and disable.
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
+  // Clear is disabled on an empty page. Like the flags above, it changes only
+  // after a stroke is finished, never during pointer-move.
+  const [isEmpty, setIsEmpty] = useState(true);
+
+  // Pen width for the next stroke. Changes only when the slider moves.
+  const [penWidth, setPenWidth] = useState(3);
 
   // Drawing data lives in refs, so drawing never triggers a React re-render.
   const strokes = useRef<Stroke[]>([]);
@@ -131,8 +140,10 @@ export default function Canvas() {
     };
 
     resize();
-    window.addEventListener('resize', resize);
-    return () => window.removeEventListener('resize', resize);
+    // The paper's size depends on the toolbar and window, so watch the canvas itself.
+    const observer = new ResizeObserver(resize);
+    observer.observe(canvas);
+    return () => observer.disconnect();
   }, []);
 
   // Convert a pointer event's position to canvas coordinates.
@@ -172,6 +183,7 @@ export default function Canvas() {
     const h = getHistory();
     setCanUndo(h.canUndo);
     setCanRedo(h.canRedo);
+    setIsEmpty(h.strokes.length === 0);
     requestRedraw();
     recompute();
   };
@@ -198,6 +210,13 @@ export default function Canvas() {
     afterChange();
   };
 
+  // Wipe the page. This is one undo step, so Undo brings the ink back.
+  const clear = () => {
+    if (strokes.current.length === 0) return;
+    strokes.current = [];
+    commit();
+  };
+
   // Stroke eraser: remove every stroke the eraser touches.
   const eraseAt = (p: Point) => {
     const before = strokes.current.length;
@@ -214,7 +233,7 @@ export default function Canvas() {
       return;
     }
 
-    current.current = { points: [toPoint(e)], width: 3 };
+    current.current = { points: [toPoint(e)], width: penWidth };
     requestRedraw();
   };
 
@@ -250,59 +269,95 @@ export default function Canvas() {
   };
 
   return (
-    <>
-      <div
-        style={{
-          position: 'fixed',
-          top: 12,
-          left: 12,
-          display: 'flex',
-          gap: 8,
-          zIndex: 1,
-        }}
-      >
-        <button onClick={() => setTool('pen')} disabled={tool === 'pen'}>
-          Pen
-        </button>
-        <button onClick={() => setTool('eraser')} disabled={tool === 'eraser'}>
-          Eraser
-        </button>
-        <button onClick={undo} disabled={!canUndo}>
-          Undo
-        </button>
-        <button onClick={redo} disabled={!canRedo}>
-          Redo
-        </button>
-      </div>
+    <div className="app">
+      <header className="topbar">
+        <h1 className="brand">
+          <LogoIcon />
+          CalcInk
+        </h1>
+        <p className="tagline">write it, get the answer</p>
+      </header>
 
-      <canvas
-        ref={canvasRef}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        style={{
-          display: 'block',
-          width: '100vw',
-          height: '100vh',
-          background: '#fdfcf7',
-          touchAction: 'none', // stop the browser from scrolling or zooming while drawing
-          cursor: tool === 'eraser' ? 'cell' : 'crosshair',
-        }}
-      />
+      <nav className="toolbar" aria-label="Drawing tools">
+        <div className="group" role="group" aria-label="Tools">
+          <span className="group-label">Tools</span>
+          <button
+            className="tool"
+            aria-label="Pen"
+            aria-pressed={tool === 'pen'}
+            onClick={() => setTool('pen')}
+          >
+            <PenIcon />
+            <span className="label">Pen</span>
+          </button>
+          <button
+            className="tool"
+            aria-label="Eraser"
+            aria-pressed={tool === 'eraser'}
+            onClick={() => setTool('eraser')}
+          >
+            <EraserIcon />
+            <span className="label">Eraser</span>
+          </button>
+        </div>
 
-      {/* Answers, drawn above the ink. Clicks and pen input pass straight through. */}
-      <canvas
-        ref={overlayRef}
-        style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          width: '100vw',
-          height: '100vh',
-          pointerEvents: 'none',
-        }}
-      />
-    </>
+        <div className="group" role="group" aria-label="History">
+          <span className="group-label">History</span>
+          <button className="tool" aria-label="Undo" onClick={undo} disabled={!canUndo}>
+            <UndoIcon />
+            <span className="label">Undo</span>
+          </button>
+          <button className="tool" aria-label="Redo" onClick={redo} disabled={!canRedo}>
+            <RedoIcon />
+            <span className="label">Redo</span>
+          </button>
+        </div>
+
+        <div className="group" role="group" aria-label="Canvas">
+          <span className="group-label">Canvas</span>
+          <button className="tool danger" aria-label="Clear" onClick={clear} disabled={isEmpty}>
+            <ClearIcon />
+            <span className="label">Clear</span>
+          </button>
+        </div>
+
+        <div className="group width-control">
+          <label className="group-label" htmlFor="pen-width">Width</label>
+          <input
+            id="pen-width"
+            className="width-slider"
+            type="range"
+            min={MIN_WIDTH}
+            max={MAX_WIDTH}
+            step={1}
+            value={penWidth}
+            aria-valuetext={`${penWidth} pixels`}
+            onChange={(e) => setPenWidth(Number(e.target.value))}
+          />
+          <span className="width-preview" aria-hidden="true">
+            <span className="width-dot" style={{ width: penWidth, height: penWidth }} />
+          </span>
+        </div>
+      </nav>
+
+      <main className="paper-card">
+        <canvas
+          ref={canvasRef}
+          className="ink-canvas"
+          aria-label="Writing area. Write a sum ending in an equals sign."
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+          style={{ cursor: tool === 'eraser' ? 'cell' : 'crosshair' }}
+        />
+
+        {/* Answers, drawn above the ink. Clicks and pen input pass straight through. */}
+        <canvas ref={overlayRef} className="answer-canvas" aria-hidden="true" />
+      </main>
+
+      {/* A ResultPanel, when added, goes here as <section className="result-panel">:
+          under the paper on desktop, a compact bar on mobile. */}
+    </div>
   );
 }
