@@ -143,10 +143,14 @@ async function readSymbol(group: SymbolGroup, lineHeight: number): Promise<strin
     return String(best(await ask('digit', toDigitInput(strokes))));
 }
 
-async function readPage(strokes: Stroke[]): Promise<string[]>
+// One line of writing as read: its text, its box, and the box of its last symbol
+// (the "=" when the line is finished), which is where the answer goes.
+export type ReadLine = { text: string; box: Box; last: Box };
+
+async function readPage(strokes: Stroke[]): Promise<ReadLine[]>
 {
     const lines = groupLines(groupStrokes(strokes));
-    const texts: string[] = [];
+    const read: ReadLine[] = [];
 
     for (const line of lines)
     {
@@ -157,16 +161,16 @@ async function readPage(strokes: Stroke[]): Promise<string[]>
         {
             text += await readSymbol(group, lineHeight);
         }
-        texts.push(text);
+        read.push({ text, box: line.box, last: line.groups[line.groups.length - 1].box });
     }
-    return texts;
+    return read;
 }
 
 // One pass at a time: the worker has a single message handler, so overlapping
 // passes would steal each other's replies.
 let queue: Promise<unknown> = Promise.resolve();
 
-export function recognizeLines(strokes: Stroke[]): Promise<string[]>
+export function recognizeLines(strokes: Stroke[]): Promise<ReadLine[]>
 {
     const result = queue.then(() => readPage(strokes));
     queue = result.catch(() => {});

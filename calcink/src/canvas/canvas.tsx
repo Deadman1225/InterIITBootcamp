@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import {recognizeLines} from '../recognize';
 import {solve} from '../math/parser.ts'
 import { StrokeHistory } from '../history';
+import { AnswerLayer } from '../overlay/answers';
+import { toAnswers } from '../overlay/toAnswers';
 
 
 export type Point = { x: number; y: number };
@@ -39,6 +41,7 @@ const hitsStroke = (p: Point, s: Stroke) => {
 
 export default function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
 
   // The toolbar must visibly update when the tool changes, so this is state.
   const [tool, setTool] = useState<Tool>('pen');
@@ -56,6 +59,11 @@ export default function Canvas() {
   // Saved versions of the stroke list, created on first use.
   const history = useRef<StrokeHistory | null>(null);
   const getHistory = () => (history.current ??= new StrokeHistory());
+
+  // Answers live on their own layer above the ink, never in the stroke list.
+  const answerLayer = useRef<AnswerLayer | null>(null);
+  // Counts recognition passes, so a slow, older pass cannot overwrite a newer one.
+  const pass = useRef(0);
 
   // Draw one stroke as a smooth curve through the midpoints of its points.
   const drawStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke) => {
@@ -109,7 +117,9 @@ export default function Canvas() {
   // Match the canvas's pixel size to its on-screen size times the device pixel ratio.
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const overlay = overlayRef.current;
+    if (!canvas || !overlay) return;
+    const layer = (answerLayer.current ??= new AnswerLayer(overlay));
 
     const resize = () => {
       const dpr = window.devicePixelRatio || 1;
@@ -117,6 +127,7 @@ export default function Canvas() {
       canvas.width = Math.round(rect.width * dpr);
       canvas.height = Math.round(rect.height * dpr);
       redraw();
+      layer.resize();
     };
 
     resize();
@@ -130,15 +141,30 @@ export default function Canvas() {
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
 
-  // Read every line again and log what it says and what it works out to.
+  // Read every line again, then draw the answers. Runs only after a change to
+  // the strokes, never on pointer-move.
   const recompute = () => {
-    recognizeLines(strokes.current).then((lines) => {
-        for (const line of lines) 
+    const layer = answerLayer.current;
+    const id = ++pass.current;
+    if (strokes.current.length === 0) {
+      layer?.show([]);
+      return;
+    }
+    layer?.setPending();
+    recognizeLines(strokes.current).then(
+      (lines) => {
+        if (id !== pass.current) return;
+        for (const line of lines)
         {
-            const result = solve(line);
-            console.log('Read:', line, '→', result ? (result.ok ? result.text : result.error) : '(no = yet)');
+            const result = solve(line.text);
+            console.log('Read:', line.text, '→', result ? (result.ok ? result.text : result.error) : '(no = yet)');
         }
-    });
+        layer?.show(toAnswers(lines));
+      },
+      () => {
+        if (id === pass.current) layer?.show([]);
+      },
+    );
   };
 
   // Repaint, re-read the page, and update the Undo/Redo buttons after any change.
@@ -232,6 +258,7 @@ export default function Canvas() {
           left: 12,
           display: 'flex',
           gap: 8,
+          zIndex: 1,
         }}
       >
         <button onClick={() => setTool('pen')} disabled={tool === 'pen'}>
@@ -261,6 +288,19 @@ export default function Canvas() {
           background: '#fdfcf7',
           touchAction: 'none', // stop the browser from scrolling or zooming while drawing
           cursor: tool === 'eraser' ? 'cell' : 'crosshair',
+        }}
+      />
+
+      {/* Answers, drawn above the ink. Clicks and pen input pass straight through. */}
+      <canvas
+        ref={overlayRef}
+        style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: '100vw',
+          height: '100vh',
+          pointerEvents: 'none',
         }}
       />
     </>
