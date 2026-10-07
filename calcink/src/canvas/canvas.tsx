@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {recognizeLines} from '../recognize';
 import {solve} from '../math/parser.ts'
+import { StrokeHistory } from '../history';
 import { AnswerLayer } from '../overlay/answers';
 import { toAnswers } from '../overlay/toAnswers';
 
@@ -45,18 +46,24 @@ export default function Canvas() {
   // The toolbar must visibly update when the tool changes, so this is state.
   const [tool, setTool] = useState<Tool>('pen');
 
+  // Only these two flags reach React, so the Undo/Redo buttons can enable and disable.
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
   // Drawing data lives in refs, so drawing never triggers a React re-render.
   const strokes = useRef<Stroke[]>([]);
   const current = useRef<Stroke | null>(null);
   const erasing = useRef(false);
   const frameRequested = useRef(false);
 
+  // Saved versions of the stroke list, created on first use.
+  const history = useRef<StrokeHistory | null>(null);
+  const getHistory = () => (history.current ??= new StrokeHistory());
+
   // Answers live on their own layer above the ink, never in the stroke list.
   const answerLayer = useRef<AnswerLayer | null>(null);
   // Counts recognition passes, so a slow, older pass cannot overwrite a newer one.
   const pass = useRef(0);
-  // The stroke list when an eraser drag began, to tell whether it removed anything.
-  const eraseStart = useRef<Stroke[] | null>(null);
 
   // Draw one stroke as a smooth curve through the midpoints of its points.
   const drawStroke = (ctx: CanvasRenderingContext2D, stroke: Stroke) => {
@@ -160,6 +167,37 @@ export default function Canvas() {
     );
   };
 
+  // Repaint, re-read the page, and update the Undo/Redo buttons after any change.
+  const afterChange = () => {
+    const h = getHistory();
+    setCanUndo(h.canUndo);
+    setCanRedo(h.canRedo);
+    requestRedraw();
+    recompute();
+  };
+
+  // Save the current stroke list as a new undo step, if it changed.
+  const commit = () => {
+    const h = getHistory();
+    if (strokes.current === h.strokes) return;
+    h.push(strokes.current);
+    afterChange();
+  };
+
+  const undo = () => {
+    const h = getHistory();
+    if (!h.undo()) return;
+    strokes.current = h.strokes;
+    afterChange();
+  };
+
+  const redo = () => {
+    const h = getHistory();
+    if (!h.redo()) return;
+    strokes.current = h.strokes;
+    afterChange();
+  };
+
   // Stroke eraser: remove every stroke the eraser touches.
   const eraseAt = (p: Point) => {
     const before = strokes.current.length;
@@ -172,7 +210,6 @@ export default function Canvas() {
 
     if (tool === 'eraser') {
       erasing.current = true;
-      eraseStart.current = strokes.current;
       eraseAt(toPoint(e));
       return;
     }
@@ -198,10 +235,10 @@ export default function Canvas() {
   };
 
   const onPointerUp = () => {
+    // A whole eraser drag is one undo step.
     if (erasing.current) {
       erasing.current = false;
-      if (strokes.current !== eraseStart.current) recompute();
-      eraseStart.current = null;
+      commit();
       return;
     }
     if (!current.current) return;
@@ -209,8 +246,7 @@ export default function Canvas() {
     // Replace the list instead of mutating it, so undo/redo can keep old versions.
     strokes.current = [...strokes.current, current.current];
     current.current = null;
-    requestRedraw();
-    recompute();
+    commit();
   };
 
   return (
@@ -230,6 +266,12 @@ export default function Canvas() {
         </button>
         <button onClick={() => setTool('eraser')} disabled={tool === 'eraser'}>
           Eraser
+        </button>
+        <button onClick={undo} disabled={!canUndo}>
+          Undo
+        </button>
+        <button onClick={redo} disabled={!canRedo}>
+          Redo
         </button>
       </div>
 
