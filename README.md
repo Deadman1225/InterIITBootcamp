@@ -1,7 +1,7 @@
 # CalcInk
 
 A web-based digital notebook that reads handwritten arithmetic and writes the
-answer next to it, entirely in the browser. Nothing is sent to a server.
+answer next to it, entirely in the browser. No backend, no inference API.
 
 **Live:** https://inter-iit-ps.vercel.app
 
@@ -24,12 +24,13 @@ Open the address printed in the terminal (usually `http://localhost:5173`).
 | Command | What it does |
 |---|---|
 | `npm run dev` | Development server with hot reload |
-| `npm run build` | Production build into `dist/` |
+| `npm run build` | Type-check, then production build into `dist/` |
 | `npm run preview` | Serve the production build locally |
-| `npm test` | Run the math engine's unit tests |
+| `npm test` | Run the unit tests (Vitest) |
+| `npm run lint` | ESLint |
 
-**Requirements:** Node 18 or newer. No API keys, no backend, no network access
-after the first load.
+**Requirements:** Node `^20.19.0 || >=22.12.0` (required by Vite 8). No API
+keys and no backend.
 
 ---
 
@@ -54,7 +55,7 @@ read each symbol                   recognize/index.ts
       ↓
 tokenize → shunting-yard → evaluate     math/parser.ts
       ↓
-30, drawn on the canvas
+30, drawn on the answer layer      overlay/answers.ts
 ```
 
 ### Strokes are stored as coordinates, not pixels
@@ -64,6 +65,20 @@ decision makes most of the rest possible: the eraser can remove a stroke by
 measuring distance to it, symbols can be regrouped without re-reading the
 screen, operators can be identified from stroke angles, and the whole page can
 be re-read after any edit.
+
+### Two canvases
+
+The ink and the answers live on separate, exactly overlapping canvases.
+
+| | Ink canvas | Answer canvas |
+|---|---|---|
+| Owner | `canvas/canvas.tsx` | `overlay/answers.ts` (`AnswerLayer`) |
+| Input | all pointer events, `touch-action: none` | `pointer-events: none` |
+| Repaints on | stroke change, resize | answer change, resize, fade, font load |
+
+Answers are never added to the stroke list, so they cannot be erased or undone,
+and — more importantly — they are never fed back into recognition. If an answer
+were ink, the next pass would read it as handwriting and solve it again.
 
 ### Segmentation
 
@@ -106,11 +121,12 @@ Neither was trained or fine-tuned by us.
 | License | MIT |
 
 **Conversion note.** The upstream package ships its trained weights as a 16 MB
-JavaScript file rather than a model file. The weights were copied unchanged
-into ONNX format so they can run under ONNX Runtime Web. No training or
-fine-tuning was performed, and the converted model's outputs match the original
-implementation to within 1e-6. The conversion script is in
-`tools/convert-math-symbols.md`.
+JavaScript file rather than a model file. The weights were read out of that file
+and written unchanged into ONNX format so they can run under ONNX Runtime Web:
+two dense layers with their bias vectors, ReLU between them and softmax at the
+end, matching the upstream forward pass. No training or fine-tuning was
+performed. The conversion script is not currently checked into this repository
+— see [Roadmap](#roadmap).
 
 ### Why two models
 
@@ -146,6 +162,10 @@ every bounding box while leaving the angle *between* two strokes unchanged —
 measured on tilted test input, box-based rules misread `=` as `2` and `+` as
 `4`, while angle-based rules read both correctly.
 
+The thresholds in these rules (straightness 0.75, angle gap 40°, flatness 0.5,
+dot size 0.2× line height) were tuned by hand during development and are not
+backed by a validation set.
+
 ---
 
 ## Math engine
@@ -164,15 +184,23 @@ BODMAS precedence. Division by zero returns `Undefined`; malformed input
 returns `Invalid`. Neither throws. Results are rounded to 12 significant digits
 so `0.1 + 0.2` displays as `0.3`.
 
-### When the app refuses to answer
+### When an answer is drawn
 
-A line is only evaluated if it contains a real binary operation — something
-followed by `+`, `−`, `×` or `÷`. Neither model has a "this is not a symbol"
-class, so a letter or a stray mark is always classified as *some* digit. We
-measured confidence as a possible filter and rejected it: the digit model
-assigns handwritten `B`, `D` and `k` a confidence of 1.00, and 13 of 30 random
-scribbles scored above 0.9. Structural validation is the reliable guard, so
-`A B C =` produces nothing while `12 + 7 =` is answered.
+A recognised line produces a visible answer only when **both** hold:
+
+- its text ends with `=`, and
+- the expression before the `=` parses and evaluates.
+
+Division by zero is drawn as `Undefined` in red. Anything that fails to parse
+draws nothing at all, with no on-screen explanation — see
+[Known issues](#known-issues).
+
+Note that this rule is purely structural in the parsing sense: it does not
+require the line to contain an actual operation. A line read as `123=` is
+therefore answered with `123`. A stricter guard requiring a binary operator is
+on the [roadmap](#roadmap) and is the intended mitigation for the fact that
+neither model can reject a non-symbol (see
+[Known limitations](#known-limitations)).
 
 ### Tests
 
@@ -180,9 +208,15 @@ scribbles scored above 0.9. Structural validation is the reliable guard, so
 npm test
 ```
 
-19 unit tests covering precedence, associativity, brackets, decimals, negative
-numbers, floating-point rounding, division by zero, malformed input, and the
-rules for when a line should not be answered.
+9 tests in `src/overlay/placement.test.ts`, run with Vitest. They cover answer
+placement (right of the `=`, wrapping below when it would overflow, and the
+just-fits boundary), device-pixel conversion at ratios 1, 1.5 and 2, font
+sizing against line height, and `toAnswers` for a solved line, division by zero
+and unreadable input.
+
+Coverage is limited to the overlay. The parser, segmentation and preprocessing
+are verified by hand at present; extending the suite to the parser is the first
+item on the [roadmap](#roadmap).
 
 ---
 
@@ -195,16 +229,26 @@ rules for when a line should not be answered.
   them into a single repaint, and coalesced pointer events are used so no
   input is lost.
 - **Re-reading the whole page took roughly 10–15 ms** in development on a page
-  of four expressions, including both models.
+  of four expressions, including both models. This was an informal measurement,
+  not a benchmark.
 - **The canvas scales for `devicePixelRatio`**, so ink stays sharp on
   high-density displays.
+- **ONNX Runtime runs single-threaded** (`ort.env.wasm.numThreads = 1`) on the
+  WASM backend. No GPU backend is attempted.
+- **Recognition is not batched or debounced.** Each symbol is sent to the
+  worker as its own request, and a full page re-read is queued on every
+  completed stroke. See [Known issues](#known-issues).
 
 ## On-device operation
 
 Both `.onnx` files and the ONNX Runtime WebAssembly binary are bundled with the
-application and served from its own origin — no CDN, no inference API. After
-the first load the application performs no network requests, which can be
-verified in the browser's Network tab.
+application and served from its own origin. There is no CDN and no inference
+API: handwriting never leaves the browser, and the app makes no requests to any
+third party at runtime.
+
+There is **no service worker**, so this is not an offline-capable PWA. Repeat
+loads are served from the browser's ordinary HTTP cache, and a hard reload
+refetches the bundle, including the ~14 MB ONNX Runtime WebAssembly binary.
 
 ---
 
@@ -212,21 +256,29 @@ verified in the browser's Network tab.
 
 ```
 calcink/
-├── public/models/
-│   ├── mnist-12.onnx           digit model
-│   └── math-symbols.onnx       symbol model
-├── src/
-│   ├── canvas/canvas.tsx       drawing, eraser, answer rendering
-│   ├── recognize/
-│   │   ├── index.ts            reading pipeline, geometry rules
-│   │   ├── segment.ts          stroke → symbol → line grouping
-│   │   ├── preProcessing.ts    strokes → model input images
-│   │   └── worker.ts           both models, off the main thread
-│   └── math/
-│       ├── parser.ts           tokenizer, shunting-yard, evaluator
-│       └── parser.test.ts      unit tests
-└── tools/
-    └── convert-math-symbols.md how the symbol model was converted to ONNX
+├── public/
+│   ├── favicon.svg
+│   ├── icons.svg
+│   └── models/
+│       ├── mnist-12.onnx        digit model
+│       └── math-symbols.onnx    symbol model
+└── src/
+    ├── main.tsx                 entry point
+    ├── App.tsx                  renders Canvas
+    ├── canvas/canvas.tsx        drawing, eraser, undo/redo, toolbar
+    ├── history.ts              undo/redo stack
+    ├── recognize/
+    │   ├── index.ts             reading pipeline, geometry rules
+    │   ├── segment.ts           stroke → symbol → line grouping
+    │   ├── preProcessing.ts     strokes → model input arrays
+    │   └── worker.ts            both models, off the main thread
+    ├── math/parser.ts           tokenizer, shunting-yard, evaluator
+    ├── overlay/
+    │   ├── answers.ts           the answer canvas layer
+    │   ├── placement.ts         where an answer is drawn
+    │   ├── placement.test.ts    unit tests
+    │   └── toAnswers.ts         recognised lines → answers to draw
+    └── ui/icons.tsx             toolbar icons
 ```
 
 ### Preprocessing
@@ -249,27 +301,100 @@ so they can run inside the worker.
 
 ## Tech stack
 
-React 19, TypeScript, Vite, ONNX Runtime Web (WASM backend), Vitest.
+React 19, TypeScript, Vite 8 (with the React Compiler via Babel),
+ONNX Runtime Web 1.30 (WASM backend), Vitest, `@fontsource/caveat` for the
+handwritten answer font.
+
 Rendering uses the Canvas 2D API with Pointer Events, so mouse, stylus and
-touch are handled by the same code path.
+touch are handled by the same code path. Stylus pressure is not used; pen width
+comes from the toolbar slider.
 
 ---
 
 ## Known limitations
 
-Stated plainly rather than discovered by the reader:
+Design limits of the current approach, stated plainly rather than discovered by
+the reader.
 
+- **Accuracy has not been measured on real handwriting.** Development testing
+  used programmatically generated strokes, not a labelled corpus. There is no
+  accuracy figure for this project.
 - **Letters and doodles cannot be rejected by the models.** Both must output
-  one of their classes. The structural check described above is the mitigation;
-  a model trained with a "not a symbol" class would be the proper fix.
+  one of their classes. We measured confidence as a possible filter and
+  rejected it: the digit model assigns handwritten `B`, `D` and `k` a
+  confidence of 1.00, and 13 of 30 random scribbles scored above 0.9.
+  Structural validation is the intended guard, and is currently weaker than it
+  should be (see [When an answer is drawn](#when-an-answer-is-drawn)).
+- **MNIST is out of distribution for this input.** It was trained on scanned,
+  thick, centred digits. Thin pointer-drawn strokes invite 1/7, 4/9 and 3/5
+  confusion even with faithful preprocessing.
+- **The symbol model is a dense network on raw pixels,** with no convolutions,
+  so it is sensitive to stroke thickness. Zhang-Suen thinning in preprocessing
+  exists to compensate for that.
 - **`=`, `÷` and `.` depend on geometric rules,** so unusual handwriting for
   those three can fail where a model might have generalised.
 - **Symbols must not touch.** Segmentation works on bounding boxes, so digits
-  written joined together are read as one symbol.
+  written joined together are read as one symbol. Conversely, a narrow symbol
+  that overlaps a neighbour's box can be merged into it.
+- **`√` is unreachable.** It is one of the symbol model's classes, but the
+  reading pipeline accepts only `+ × − ( )` from that model and the parser has
+  no square-root support, so a `√` prediction falls through to the digit model
+  and returns a digit.
 - **First load is large** because the ONNX Runtime WebAssembly binary is around
-  14 MB. Subsequent loads are served from cache.
-- **Accuracy was measured on programmatically generated strokes** during
-  development, not on a labelled corpus of real handwriting.
+  14 MB.
+- **No persistence.** Reloading the page clears the notebook. There is no save,
+  export or local storage.
+- **The eraser removes whole strokes,** not parts of them.
+- **One fixed page.** No pan, zoom, scroll or multiple pages.
+- **No keyboard shortcuts** for undo and redo.
+- **Answers are not exposed to assistive technology.** The answer canvas is
+  `aria-hidden`, so a screen-reader user can find the writing area but not read
+  the result.
+- **Scope.** Single-line arithmetic only: no fractions, exponents, stacked
+  (column) arithmetic or variables.
+
+## Known issues
+
+Behaviour that is simply wrong rather than out of scope.
+
+- **Every completed stroke queues a full page re-read, with no debounce and no
+  cancellation.** A counter discards a stale pass's *result*, but the work still
+  runs. Writing quickly builds a backlog of complete page reads that execute
+  one after another, so the answer lags further behind the longer you write.
+- **Inference is one request per symbol.** The symbol model's input shape
+  `[n, 1024]` supports batching, but it is called with `[1, 1024]` once per
+  symbol, and digits cost a second round trip to MNIST. A ten-symbol line is
+  15–20 worker messages where it could be two.
+- **The worker has a single reassigned `onmessage` handler and no request IDs.**
+  This is correct only because reads are awaited sequentially and passes are
+  serialised through a promise queue; any concurrent call would cross replies.
+- **An eraser tap that removes nothing still creates an undo step,** because
+  `Array.prototype.filter` always returns a new array and the change check
+  compares by reference.
+- **Model load failure is silent.** The worker posts `ready` and `error`
+  messages that nothing listens for, and there is no timeout. If an `.onnx`
+  file fails to load, writing a sum simply produces no answer and no message.
+- **Unparseable input gives no feedback,** so a misread is indistinguishable
+  from a broken app.
+- **An answer can be drawn over existing ink.** Placement avoids the right edge
+  of the view but does not check for collisions with strokes.
+- **Recognition results are logged to the console** on every pass.
+
+## Roadmap
+
+In rough order of value:
+
+1. Unit tests for `math/parser.ts`, then for `recognize/segment.ts` and the
+   geometry rules.
+2. Measure accuracy on a set of real handwritten expressions and publish the
+   number.
+3. Debounce recognition and cancel superseded passes.
+4. Batch inference into one request per line, and tag worker messages with
+   request IDs.
+5. Require a binary operator before answering a line.
+6. Surface model-load failures and unreadable input in the UI.
+7. Check the model conversion script into `tools/`.
+8. Persistence and export.
 
 ---
 
